@@ -71,13 +71,17 @@ echo "App ready after ${elapsed}s."
 docker exec "$APP_CONTAINER" python -c "from app.app import init_db; init_db()"
 
 echo "Running pytest smoke suite from a sibling container..."
+# Use the official Python image (not cimg/*) on remote Docker — convenience
+# images expect the CircleCI primary environment and can boot into system
+# Python 3.8, which breaks modern pip bootstraps.
 docker create \
   --name "$RUNNER_CONTAINER" \
   --network "$NETWORK_NAME" \
+  --entrypoint bash \
   -w /work \
   -e "BASE_URL=http://${APP_CONTAINER}:${APP_PORT}" \
-  cimg/python:3.12 \
-  bash -lc 'pip install -q -r requirements.txt -r tests/requirements-test.txt && mkdir -p test-results && pytest --junitxml=test-results/image-junit.xml tests/test_image_smoke.py'
+  python:3.12-slim \
+  -lc 'pip install -q -r requirements.txt -r tests/requirements-test.txt && mkdir -p test-results && pytest --junitxml=test-results/image-junit.xml tests/test_image_smoke.py'
 
 docker cp "${PWD}/requirements.txt" "${RUNNER_CONTAINER}:/work/requirements.txt"
 docker cp "${PWD}/app" "${RUNNER_CONTAINER}:/work/app"

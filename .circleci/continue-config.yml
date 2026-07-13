@@ -22,7 +22,7 @@ jobs:
 
   unit-test:
     docker:
-      - image: cimg/python:3.12
+      - image: cimg/python:3.12.8
       # Sidecar / secondary container: off-the-shelf Postgres image
       # running alongside the primary container for the duration of the job.
       - image: cimg/postgres:16.2
