@@ -4,27 +4,11 @@ parameters:
   run-build:
     type: boolean
     default: false
-
-orbs:
-  gcp-cli: circleci/gcp-cli@2.4.1
-
-commands:
-  # Exchanges the CircleCI OIDC token for short-lived GCP credentials by
-  # impersonating a service account through Workload Identity Federation.
-  # No service account key ever touches CircleCI.
-  gcp-oidc-authenticate:
-    steps:
-      - run:
-          name: Authenticate to GCP via OIDC
-          command: |
-            echo $CIRCLE_OIDC_TOKEN > /home/circleci/oidc_token.json
-            gcloud iam workload-identity-pools create-cred-config \
-              "projects/${GCP_PROJECT_ID}/locations/global/workloadIdentityPools/${GCP_WIP_ID}/providers/${GCP_WIP_PROVIDER_ID}" \
-              --output-file="/home/circleci/gcp_cred_config.json" \
-              --service-account="${GCP_SERVICE_ACCOUNT_EMAIL}" \
-              --credential-source-file="/home/circleci/oidc_token.json"
-            gcloud auth login --brief --cred-file "/home/circleci/gcp_cred_config.json"
-            echo "export GOOGLE_APPLICATION_CREDENTIALS='/home/circleci/gcp_cred_config.json'" | tee -a "$BASH_ENV"
+  # Keep false until the vercel-deploy context is configured, so CI can go
+  # green on lint/unit/build/image-test first. Flip to true to enable publish.
+  deploy:
+    type: boolean
+    default: false
 
 jobs:
   lint-shell:
@@ -35,6 +19,51 @@ jobs:
       - run:
           name: Shellcheck all scripts
           command: shellcheck scripts/*.sh
+
+  unit-test:
+    docker:
+      - image: cimg/python:3.12
+      # Sidecar / secondary container: off-the-shelf Postgres image
+      # running alongside the primary container for the duration of the job.
+      - image: cimg/postgres:16.2
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: app_test
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/app_test
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - pip-v1-{{ checksum "requirements.txt" }}-{{ checksum "tests/requirements-test.txt" }}
+            - pip-v1-
+      - run:
+          name: Install postgres client
+          command: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - run:
+          name: Wait for Postgres sidecar
+          command: |
+            chmod +x scripts/wait_for_postgres.sh
+            scripts/wait_for_postgres.sh localhost 5432 30
+      - run:
+          name: Install app + test dependencies
+          command: |
+            pip install --user -r requirements.txt
+            pip install --user -r tests/requirements-test.txt
+      - save_cache:
+          key: pip-v1-{{ checksum "requirements.txt" }}-{{ checksum "tests/requirements-test.txt" }}
+          paths:
+            - ~/.local
+      - run:
+          name: Run unit tests, emit JUnit XML
+          command: |
+            mkdir -p test-results
+            pytest --junitxml=test-results/junit.xml --cov=app tests/test_app.py
+      - store_test_results:
+          path: test-results
+      - store_artifacts:
+          path: test-results
 
   build-image:
     docker:
@@ -53,45 +82,9 @@ jobs:
           paths:
             - image.tar
 
-  test:
+  image-test:
     docker:
-      - image: cimg/python:3.12
-      # Sidecar / secondary container: off-the-shelf Postgres image
-      # running alongside the primary container for the duration of the job.
-      - image: cimg/postgres:16.2
-        environment:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: app_test
-    environment:
-      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/app_test
-    steps:
-      - checkout
-      - run:
-          name: Install postgres client
-          command: sudo apt-get update && sudo apt-get install -y postgresql-client
-      - run:
-          name: Wait for Postgres sidecar
-          command: |
-            chmod +x scripts/wait_for_postgres.sh
-            scripts/wait_for_postgres.sh localhost 5432 30
-      - run:
-          name: Install app + test dependencies
-          command: |
-            pip install -r app/requirements.txt
-            pip install -r tests/requirements-test.txt
-      - run:
-          name: Run tests, emit JUnit XML
-          command: |
-            mkdir -p test-results
-            pytest --junitxml=test-results/junit.xml --cov=app tests/
-      - store_test_results:
-          path: test-results
-      - store_artifacts:
-          path: test-results
-
-  publish:
-    executor: gcp-cli/default
+      - image: cimg/base:2024.01
     steps:
       - checkout
       - attach_workspace:
@@ -99,36 +92,55 @@ jobs:
       - setup_remote_docker:
           docker_layer_caching: true
       - run:
-          name: Load built image
+          name: Load custom image built earlier in the pipeline
           command: docker load -i image.tar
-      - gcp-cli/install
-      # OIDC: no service account key stored in CircleCI. This exchanges
-      # CircleCI's OIDC token for a short-lived GCP credential by
-      # impersonating a service account through Workload Identity Federation.
-      - gcp-oidc-authenticate
       - run:
-          name: Publish image and deploy to Cloud Run
+          name: Smoke-test the custom image against Postgres
           command: |
-            chmod +x scripts/publish_image.sh
-            scripts/publish_image.sh
+            chmod +x scripts/run_image_smoke.sh
+            scripts/run_image_smoke.sh
+      - store_test_results:
+          path: test-results
+      - store_artifacts:
+          path: test-results
+
+  publish:
+    docker:
+      - image: cimg/node:20.11
+    steps:
+      - checkout
+      - run:
+          name: Install Vercel CLI
+          command: npm install --global vercel@latest
+      - run:
+          name: Publish to Vercel production
+          command: |
+            chmod +x scripts/publish_vercel.sh
+            scripts/publish_vercel.sh
 
 workflows:
   build-test-publish:
     when: << pipeline.parameters.run-build >>
     jobs:
       - lint-shell
-      - build-image:
+      - unit-test
+      - build-image
+      # image-test only runs after lint, unit tests, and the custom image
+      # build all succeed — upstream failure skips unnecessary smoke work.
+      - image-test:
           requires:
             - lint-shell
-      - test:
-          requires:
+            - unit-test
             - build-image
-      # Credentials are only reachable inside this context, and this job
-      # only runs on merge to main - PR builds and forks never see it.
+      # Gated by pipeline parameter `deploy` (default false) so we can land a
+      # green build before Vercel credentials exist. When ready: set deploy=true
+      # (pipeline trigger or change the default) and ensure context vercel-deploy
+      # is configured. Still main-only + restricted context.
       - publish:
-          context: gcp-oidc-deploy
+          when: << pipeline.parameters.deploy >>
+          context: vercel-deploy
           requires:
-            - test
+            - image-test
           filters:
             branches:
               only: main

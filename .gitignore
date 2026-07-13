@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.vercel/
+test-results/
+image.tar
+.DS_Store
+.env
+.env.*
+!.env.example

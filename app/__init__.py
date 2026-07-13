@@ -1,0 +1,1 @@
+"""Flask widget API package."""

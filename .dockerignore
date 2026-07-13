@@ -1,0 +1,10 @@
+.git
+.circleci
+.qodo
+.vercel
+.cursor
+*.md
+tests
+scripts
+.dockerignore
+.gitignore

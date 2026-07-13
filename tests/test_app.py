@@ -5,12 +5,20 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.app import Base, app, engine  # noqa: E402
+from app.app import Base, app, get_engine, init_db  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def clean_db():
+    engine = get_engine()
+    Base.metadata.drop_all(engine)
+    init_db()
+    yield
+    Base.metadata.drop_all(engine)
 
 
 @pytest.fixture
 def client():
-    Base.metadata.create_all(engine)
     app.config["TESTING"] = True
     with app.test_client() as test_client:
         yield test_client
@@ -22,11 +30,18 @@ def test_health(client):
     assert resp.get_json()["status"] == "ok"
 
 
+def test_ready(client):
+    resp = client.get("/ready")
+    assert resp.status_code == 200
+    assert resp.get_json()["status"] == "ready"
+
+
 def test_create_widget(client):
     resp = client.post("/widgets", json={"name": "sprocket"})
     assert resp.status_code == 201
     body = resp.get_json()
     assert body["name"] == "sprocket"
+    assert "id" in body
 
 
 def test_list_widgets(client):
