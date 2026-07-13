@@ -1,0 +1,134 @@
+version: 2.1
+
+parameters:
+  run-build:
+    type: boolean
+    default: false
+
+orbs:
+  gcp-cli: circleci/gcp-cli@2.4.1
+
+commands:
+  # Exchanges the CircleCI OIDC token for short-lived GCP credentials by
+  # impersonating a service account through Workload Identity Federation.
+  # No service account key ever touches CircleCI.
+  gcp-oidc-authenticate:
+    steps:
+      - run:
+          name: Authenticate to GCP via OIDC
+          command: |
+            echo $CIRCLE_OIDC_TOKEN > /home/circleci/oidc_token.json
+            gcloud iam workload-identity-pools create-cred-config \
+              "projects/${GCP_PROJECT_ID}/locations/global/workloadIdentityPools/${GCP_WIP_ID}/providers/${GCP_WIP_PROVIDER_ID}" \
+              --output-file="/home/circleci/gcp_cred_config.json" \
+              --service-account="${GCP_SERVICE_ACCOUNT_EMAIL}" \
+              --credential-source-file="/home/circleci/oidc_token.json"
+            gcloud auth login --brief --cred-file "/home/circleci/gcp_cred_config.json"
+            echo "export GOOGLE_APPLICATION_CREDENTIALS='/home/circleci/gcp_cred_config.json'" | tee -a "$BASH_ENV"
+
+jobs:
+  lint-shell:
+    docker:
+      - image: koalaman/shellcheck-alpine:stable
+    steps:
+      - checkout
+      - run:
+          name: Shellcheck all scripts
+          command: shellcheck scripts/*.sh
+
+  build-image:
+    docker:
+      - image: cimg/base:2024.01
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: Build custom Docker image
+          command: |
+            docker build -t "app:${CIRCLE_SHA1}" .
+            docker save -o image.tar "app:${CIRCLE_SHA1}"
+      - persist_to_workspace:
+          root: .
+          paths:
+            - image.tar
+
+  test:
+    docker:
+      - image: cimg/python:3.12
+      # Sidecar / secondary container: off-the-shelf Postgres image
+      # running alongside the primary container for the duration of the job.
+      - image: cimg/postgres:16.2
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: app_test
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/app_test
+    steps:
+      - checkout
+      - run:
+          name: Install postgres client
+          command: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - run:
+          name: Wait for Postgres sidecar
+          command: |
+            chmod +x scripts/wait_for_postgres.sh
+            scripts/wait_for_postgres.sh localhost 5432 30
+      - run:
+          name: Install app + test dependencies
+          command: |
+            pip install -r app/requirements.txt
+            pip install -r tests/requirements-test.txt
+      - run:
+          name: Run tests, emit JUnit XML
+          command: |
+            mkdir -p test-results
+            pytest --junitxml=test-results/junit.xml --cov=app tests/
+      - store_test_results:
+          path: test-results
+      - store_artifacts:
+          path: test-results
+
+  publish:
+    executor: gcp-cli/default
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: Load built image
+          command: docker load -i image.tar
+      - gcp-cli/install
+      # OIDC: no service account key stored in CircleCI. This exchanges
+      # CircleCI's OIDC token for a short-lived GCP credential by
+      # impersonating a service account through Workload Identity Federation.
+      - gcp-oidc-authenticate
+      - run:
+          name: Publish image and deploy to Cloud Run
+          command: |
+            chmod +x scripts/publish_image.sh
+            scripts/publish_image.sh
+
+workflows:
+  build-test-publish:
+    when: << pipeline.parameters.run-build >>
+    jobs:
+      - lint-shell
+      - build-image:
+          requires:
+            - lint-shell
+      - test:
+          requires:
+            - build-image
+      # Credentials are only reachable inside this context, and this job
+      # only runs on merge to main - PR builds and forks never see it.
+      - publish:
+          context: gcp-oidc-deploy
+          requires:
+            - test
+          filters:
+            branches:
+              only: main

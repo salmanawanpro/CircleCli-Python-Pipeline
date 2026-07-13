@@ -1,0 +1,23 @@
+version: 2.1
+
+setup: true
+
+orbs:
+  path-filtering: circleci/path-filtering@1.1.0
+
+workflows:
+  setup-workflow:
+    jobs:
+      # Diffs the current commit against main and sets the run-build
+      # pipeline parameter based on which paths changed. This is the
+      # "conditional work" requirement: docs-only or unrelated changes
+      # never trigger a Docker build, DB-backed test run, or publish.
+      - path-filtering/filter:
+          base-revision: main
+          config-path: .circleci/continue-config.yml
+          mapping: |
+            app/.*        run-build true
+            tests/.*      run-build true
+            scripts/.*    run-build true
+            Dockerfile    run-build true
+            .circleci/.*  run-build true
